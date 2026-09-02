@@ -10,14 +10,23 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    # 拿不到机器时别干等：默认超时是 6 小时
+    timeout-minutes: 25
+    # 可选目标构建不出来也不挡发布（Intel Mac 和 ARM 机器池经常排不上）
+    continue-on-error: ${{ matrix.optional || false }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # ---- 主力目标，必须成功 ----
           - os: windows-latest
             label: windows-x64
             asset: EVE-Accel-windows-x64.exe
@@ -26,14 +35,28 @@ jobs:
             label: macos-arm64
             asset: EVE-Accel-macos-arm64
             extra: ""
+          # Linux 用 22.04 构建，glibc 下限低一些，旧发行版也能跑
+          - os: ubuntu-22.04
+            label: linux-x64
+            asset: EVE-Accel-linux-x64
+            extra: ""
+
+          # ---- 补充架构，尽力而为 ----
           - os: macos-13
             label: macos-x64
             asset: EVE-Accel-macos-x64
             extra: ""
-          - os: ubuntu-latest
-            label: linux-x64
-            asset: EVE-Accel-linux-x64
+            optional: true
+          - os: windows-11-arm
+            label: windows-arm64
+            asset: EVE-Accel-windows-arm64.exe
+            extra: --uac-admin
+            optional: true
+          - os: ubuntu-22.04-arm
+            label: linux-arm64
+            asset: EVE-Accel-linux-arm64
             extra: ""
+            optional: true
 
     steps:
       - uses: actions/checkout@v4
@@ -97,7 +120,8 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - run: ls -laR artifacts
+      - name: 列出这次实际构建出来的文件
+        run: ls -la artifacts
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -109,9 +133,14 @@ jobs:
             | 系统 | 文件 |
             |------|------|
             | Windows 64 位 | `EVE-Accel-windows-x64.exe` |
+            | Windows ARM | `EVE-Accel-windows-arm64.exe` |
             | macOS Apple 芯片 | `EVE-Accel-macos-arm64` |
             | macOS Intel | `EVE-Accel-macos-x64` |
             | Linux 64 位 | `EVE-Accel-linux-x64` |
+            | Linux ARM | `EVE-Accel-linux-arm64` |
+
+            ARM 版和 Intel Mac 版受构建机器供给影响，偶尔会缺；
+            列表里没有的平台可以直接跑源码，零第三方依赖。
 
             Windows 双击运行即可（会弹 UAC，改 hosts 需要管理员权限）。
 
@@ -123,5 +152,5 @@ jobs:
             sudo ./EVE-Accel-macos-arm64
             ```
 
-            杀毒软件/Gatekeeper 对未签名的打包程序普遍会拦，介意的话直接跑源码：
+            杀毒软件和 Gatekeeper 对未签名的打包程序普遍会拦，介意的话直接跑源码：
             `python eve_accel.py`（Python 3.8+，零第三方依赖）。

@@ -15,9 +15,13 @@ EVE Online 启动器更新太慢时用的小工具，能做三件事。
 | 系统 | 文件 |
 |------|------|
 | Windows 64 位 | `EVE-Accel-windows-x64.exe` |
+| Windows ARM | `EVE-Accel-windows-arm64.exe` |
 | macOS Apple 芯片 | `EVE-Accel-macos-arm64` |
 | macOS Intel | `EVE-Accel-macos-x64` |
 | Linux 64 位 | `EVE-Accel-linux-x64` |
+| Linux ARM | `EVE-Accel-linux-arm64` |
+
+ARM 版和 Intel Mac 版受构建机器供给影响，某个版本偶尔会缺。没有的话直接跑源码，零第三方依赖。
 
 Windows 双击运行（会弹 UAC，改 hosts 需要管理员权限）。
 
