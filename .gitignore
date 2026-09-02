@@ -1,0 +1,14 @@
+# 打包产物（由 GitHub Actions 构建）
+dist/
+build/
+*.spec
+
+# 运行时生成
+eve_accel.json
+eve_accel.json.old
+__pycache__/
+*.pyc
+
+# 编辑器
+.vscode/
+.idea/
