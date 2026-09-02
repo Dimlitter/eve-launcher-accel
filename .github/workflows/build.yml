@@ -18,8 +18,9 @@ jobs:
   build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
-    # 拿不到机器时别干等：默认超时是 6 小时
-    timeout-minutes: 25
+    # 拿不到机器时别干等：默认超时是 6 小时。
+    # 可选目标给的时间更短，免得打 tag 发版时为了它多等一刻钟。
+    timeout-minutes: ${{ matrix.optional && 12 || 25 }}
     # 可选目标构建不出来也不挡发布（Intel Mac 和 ARM 机器池经常排不上）
     continue-on-error: ${{ matrix.optional || false }}
     strategy:
@@ -112,7 +113,10 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # 用 always()：可选目标排不到机器会被超时取消，而被取消的 job 会让整个 run 变成
+    # cancelled，进而连累 release。所以这里不看 build 的整体结论，
+    # 改成下面那步直接检查三个主力产物在不在。
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -122,6 +126,18 @@ jobs:
 
       - name: 列出这次实际构建出来的文件
         run: ls -la artifacts
+
+      - name: 三个主力平台缺一个就不发版
+        run: |
+          missing=0
+          for f in EVE-Accel-windows-x64.exe EVE-Accel-macos-arm64 EVE-Accel-linux-x64; do
+            if [ -f "artifacts/$f" ]; then
+              echo "有 $f"
+            else
+              echo "缺少 $f"; missing=1
+            fi
+          done
+          exit $missing
 
       - uses: softprops/action-gh-release@v2
         with:
