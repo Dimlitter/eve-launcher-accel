@@ -123,6 +123,18 @@ python eve_accel.py
 - 长连接复用 + 定期重建，中途 Ctrl+C 可以停，已下好的都留着，下次接着下
 - 只碰 `ResFiles` 里的资源文件，不动客户端本体
 
+**它做得到什么，做不到什么**
+
+EVE 的 CDN 不支持 HTTP Range：响应是 chunked、没有内容长度，带 `Range` 的请求一律返回 200
+（连 `bytes=0-0` 都给你整个文件）。所以**单个文件没法切开给多条连接**。
+更新缺一大堆小文件时，多连接很有用；只缺一个大文件时，能做的只剩挑一个快节点。
+实测同一时刻不同边缘节点能差十倍，所以下载前会先粗测、再对领先的几个复测持续速度。
+
+索引也按平台挑：Windows 上用 `resfileindex_Windows.txt`（0.5 MB），不用跨平台的
+`resfileindex.txt`（19.7 MB）。全量索引里有 Windows 客户端根本不会下载的文件，
+照着它比对会让人白下几百 MB 用不到的东西。想强行用全量索引，把配置里的
+`res_index` 改成 `full`。
+
 ## 加速哪些域名
 
 | 域名 | 作用 |
@@ -168,7 +180,7 @@ python eve_accel.py --test        # 只检测，不动 hosts
 python eve_accel.py --diagnose    # 掉速诊断
 ```
 
-发布由 GitHub Actions 完成：推一个 `v*` tag 就会自动构建四个平台的可执行文件并创建 Release。
+发布由 GitHub Actions 完成：推一个 `v*` tag 就会自动构建五个平台的可执行文件并创建 Release。
 本地想自己打包：
 
 ```bash

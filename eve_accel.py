@@ -18,6 +18,7 @@ EVE 启动器更新加速器
 import argparse
 import ctypes
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -34,7 +35,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 APP_NAME = "EVE 启动器更新加速器"
-APP_VER = "2.0.0"
+APP_VER = "2.2.0"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 EVELauncher/2")
 
@@ -99,7 +100,8 @@ DEFAULT_CONFIG = {
         "predownload_threads": 8,    # 并发预下载的连接数（按连接限速时，这个才是关键）
         "predownload_timeout": 12.0,  # 单个文件的超时，卡住的连接会被及时换掉
         "predownload_recycle": 64,   # 每条连接下多少个文件就重建，防止被中间设备静默掐死
-        "shared_cache": ""           # EVE 共享缓存目录，留空 = 自动探测
+        "shared_cache": "",          # EVE 共享缓存目录，留空 = 自动探测
+        "res_index": "auto"          # auto = 按平台挑索引；full = 跨平台全量索引
     }
 }
 
@@ -2080,51 +2082,202 @@ class PinnedSession(object):
         return 0, b""
 
 
-def fetch_res_index(st, build, ips):
-    """取完整的资源文件索引（约 20MB），按 build 缓存到本地，不重复下。"""
-    cached = os.path.join(APP_DIR, "resindex_%s.txt" % build)
-    if os.path.exists(cached) and os.path.getsize(cached) > 1000000:
+def _pick_res_index(app_txt, st):
+    """挑一份和当前平台匹配的资源索引，返回 (文件名, CDN路径, 大小, md5)。
+
+    全量索引是跨平台的，里面有 Windows 客户端根本不会下载的文件。照着它比对，
+    会让人白下几百 MB 用不到的东西。"""
+    found = {}
+    for ln in app_txt.splitlines():
+        if not ln.startswith("app:/resfileindex"):
+            continue
+        f = ln.split(",")
+        if len(f) < 5 or "/" not in f[1]:
+            continue
         try:
-            with io.open(cached, encoding="utf-8", errors="replace") as f:
-                return f.read()
-        except Exception:
-            pass
+            found[f[0].split("/")[-1]] = (f[1].strip(), int(f[3]), f[2].strip())
+        except ValueError:
+            continue
+    if str(st.get("res_index", "auto")).lower() == "full":
+        order = ["resfileindex.txt"]
+    elif IS_WIN:
+        order = ["resfileindex_Windows.txt", "resfileindex.txt"]
+    else:
+        order = ["resfileindex.txt"]
+    for name in order:
+        if name in found:
+            cdn, size, md5 = found[name]
+            return name, cdn, size, md5
+    return None, None, 0, ""
+
+
+def fetch_res_index(st, build, ips):
+    """取资源索引，按 build 和索引名缓存到本地。"""
     app = _fetch_from_any(BIN_HOST, "/eveonline_%s.txt" % build, ips, 4000000, 25.0, 20.0)
     if not app:
         return None
-    entry = None
-    for ln in app.body.decode("utf-8", "replace").splitlines():
-        if ln.startswith("app:/resfileindex.txt,"):
-            f = ln.split(",")
-            if len(f) >= 4:
-                entry = (f[1].strip(), int(f[3]))
-            break
-    if not entry:
+    name, cdn, size, md5 = _pick_res_index(app.body.decode("utf-8", "replace"), st)
+    if not cdn:
         return None
-    info("  下载资源索引 %.1f MB…" % (entry[1] / 1048576.0))
+
+    cached = os.path.join(APP_DIR, "resindex_%s_%s" % (build, name))
+    if os.path.exists(cached) and os.path.getsize(cached) >= size * 0.9:
+        try:
+            with io.open(cached, encoding="utf-8", errors="replace") as f:
+                txt = f.read()
+            dim("  复用已缓存的 %s" % name)
+            return txt
+        except Exception:
+            pass
+
+    info("  下载 %s（%s）…" % (name, human_size(size)))
     last = [0.0]
 
     def prog(n, el):
         if el - last[0] >= 1.0:
             last[0] = el
-            sys.stdout.write("\r    %.1f / %.1f MB" % (n / 1048576.0, entry[1] / 1048576.0))
+            sys.stdout.write("\r    %s / %s" % (human_size(n), human_size(size)))
             sys.stdout.flush()
 
-    for ip in ips[:4]:
-        r = https_request(ip, BIN_HOST, "/" + entry[0], "GET", None, 30.0,
-                          entry[1] + 4096, entry[1] + 4096, 600.0, 443, 0, 0.0, prog)
-        sys.stdout.write("\r" + " " * 40 + "\r")
+    order = list(ips)
+    if size > 2 * 1024 * 1024:          # 索引够大才值得先花时间挑节点
+        fast = pick_download_nodes(BIN_HOST, "/" + cdn, st, want=2)
+        order = fast + [x for x in ips if x not in fast]
+    for ip in order[:4]:
+        r = https_request(ip, BIN_HOST, "/" + cdn, "GET", None, 30.0,
+                          size + 65536, size + 65536, 900.0, 443, 0, 0.0, prog)
+        sys.stdout.write("\r" + " " * 44 + "\r")
         sys.stdout.flush()
-        if r.ok and r.status == 200 and r.nbytes > 1000000:
+        if r.ok and r.status == 200 and r.nbytes == size:
+            if md5 and hashlib.md5(r.body).hexdigest() != md5:
+                warn("    索引校验不通过，换个节点重试")
+                continue
             txt = r.body.decode("utf-8", "replace")
             try:
                 os.makedirs(APP_DIR, exist_ok=True)
-                with io.open(cached, "w", encoding="utf-8") as f:
+                with io.open(cached, "w", encoding="utf-8", newline="") as f:
                     f.write(txt)
-            except Exception:
-                pass
+            except Exception as e:
+                warn("    索引缓存没写成功，下次还得重下：%s" % e)
             return txt
     return None
+
+
+def _bar_progress(prefix="    "):
+    """下载进度回调：终端里原地刷新，重定向到文件时每 5 秒打一行。"""
+    state = {"t": 0.0}
+    try:
+        tty = bool(sys.stdout.isatty())
+    except Exception:
+        tty = False
+    start = time.perf_counter()
+
+    def cb(done, total):
+        now = time.perf_counter()
+        if now - state["t"] < (0.5 if tty else 5.0):
+            return
+        state["t"] = now
+        el = max(0.001, now - start)
+        line = "%s%s / %s  %s" % (prefix, human_size(done), human_size(total),
+                                  human_speed(done / el))
+        if tty:
+            sys.stdout.write("\r" + line + "    ")
+            sys.stdout.flush()
+        else:
+            print(line, flush=True)
+    return cb
+
+
+def pick_download_nodes(host, sample_path, st, want=4):
+    """拿一个真实文件当样本，实测候选节点的速度后排序。
+
+    同一时刻不同边缘节点能差十倍以上，节点挑得对不对比开几条连接更能决定快慢。
+    分两轮：先短测淘汰明显不行的，再对领先的几个测持续速度——有节点粗测 1.33 MB/s，
+    复测时直接垮掉，只看头几秒会挑错人。"""
+    cands = list(system_resolve(host))
+    if st.get("cf_scan", True):
+        try:
+            for ip in scan_cloudflare_edges(int(st.get("cf_scan_count", 320)),
+                                            int(st.get("cf_keep", 12))):
+                if ip not in cands:
+                    cands.append(ip)
+        except Exception:
+            pass
+    seen, uniq = set(), []
+    for ip in cands:
+        if ip not in seen:
+            seen.add(ip)
+            uniq.append(ip)
+    uniq = uniq[:8]
+    if not uniq:
+        return []
+
+    info("  粗测 %d 个候选节点…" % len(uniq))
+    rough = []
+    for ip in uniq:
+        # 串行测，免得互相抢带宽
+        sp, _sus, _nb, okd = measure_speed(ip, host, [sample_path], st,
+                                           seconds=3.0, want=3 * 1024 * 1024)
+        if okd and sp > 0:
+            rough.append((sp, ip))
+        dim("    %-16s %s" % (ip, human_speed(sp) if sp else "不可用"))
+    rough.sort(reverse=True)
+    if len(rough) < 2:
+        return [ip for _s, ip in rough[:want]]
+
+    finals = rough[:3]
+    info("  复测前 %d 名的持续速度…" % len(finals))
+    rescored = []
+    for _sp, ip in finals:
+        sp, sus, _nb, okd = measure_speed(
+            ip, host, [sample_path], st,
+            seconds=float(st.get("speed_seconds", 7.0)),
+            want=int(st.get("speed_bytes", 12582912)),
+            warmup=int(st.get("warmup_bytes", 3145728)),
+            warmup_secs=float(st.get("warmup_seconds", 2.0)))
+        eff = sus or sp
+        if okd and eff > 0:
+            rescored.append((eff, ip))
+        dim("    %-16s 起步 %-11s 持续 %s"
+            % (ip, human_speed(sp), human_speed(sus) if sus else "样本不足"))
+    if not rescored:
+        return [ip for _s, ip in rough[:want]]
+    rescored.sort(reverse=True)
+    picked = [ip for _e, ip in rescored]
+    return (picked + [ip for _s, ip in rough if ip not in picked])[:want]
+
+
+def single_download(host, ip, path, size, expect_md5, dest, st, on_progress=None):
+    """单连接下载一个文件，校验 md5 后原子落盘。
+
+    EVE 的 CDN 不支持 Range（响应 chunked、无 content-length、带 Range 也返回 200），
+    所以一个文件没法切给多条连接，只能挑一个快节点老实下。"""
+    tmp = dest + ".eveaccel.part"
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+    except Exception as e:
+        warn("  建目录失败：%s" % e)
+        return False
+
+    def prog(n, _el):
+        if on_progress:
+            on_progress(n, size)
+
+    r = https_request(ip, host, path, "GET", None, float(st["verify_timeout"]),
+                      size + 65536, size + 65536, 7200.0, 443, 0, 0.0, prog)
+    if not (r.ok and r.status == 200 and r.nbytes == size):
+        return False
+    if expect_md5 and hashlib.md5(r.body).hexdigest() != expect_md5:
+        warn("  校验不通过，已丢弃")
+        return False
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(r.body)
+        os.replace(tmp, dest)
+    except Exception as e:
+        warn("  落盘失败：%s" % e)
+        return False
+    return True
 
 
 def scan_local_resfiles(resroot):
@@ -2217,19 +2370,21 @@ def do_predownload(cfg, assume_yes=False):
             continue
         missing.append((cdn, f[2].strip(), size))
     need_bytes = sum(m[2] for m in missing)
-    info("  索引 %d 个资源文件，本地已有 %d 个文件" % (total_entries, total_local))
+    info("  索引里 %d 个资源文件，本地已有 %d 个文件" % (total_entries, total_local))
     if not missing:
         ok("本地缓存已经是齐的，没有需要预下载的文件。")
         return True
     info("  缺少 %d 个，合计 %s" % (len(missing), human_size(need_bytes)))
 
     threads = max(1, min(32, int(st.get("predownload_threads", 8))))
-    node = system_resolve(RES_HOST)
-    if not node:
+    nodes = pick_download_nodes(RES_HOST, "/" + missing[0][0], st, want=4)
+    if not nodes:
+        nodes = system_resolve(RES_HOST)
+    if not nodes:
         err("解析不到 %s。" % RES_HOST)
         return False
-    node_ip = node[0]
-    info("  将用 %d 条并发连接，从节点 %s 下载" % (threads, node_ip))
+    info("  用这几个节点：%s" % "、".join(nodes))
+    info("  %d 条并发连接分散到 %d 个节点（顺便绕开单 IP 限速）" % (threads, len(nodes)))
     if not assume_yes:
         try:
             if input("开始下载？[y/N] ").strip().lower() not in ("y", "yes"):
@@ -2238,13 +2393,46 @@ def do_predownload(cfg, assume_yes=False):
         except (EOFError, KeyboardInterrupt):
             return False
 
+    # 大文件单独走：一个线程负责一个文件的并发，碰上"只缺一个大文件"就退化成单连接。
+    # 而这个 CDN 不支持 Range，一个文件切不开，所以大文件只能挑最快的节点老实下。
+    big_min = int(st.get("range_min_size", 4194304))
+    big = [m for m in missing if m[2] >= big_min]
+    small = [m for m in missing if m[2] < big_min]
+    if big:
+        info("")
+        step("先下 %d 个大文件（单个文件切不开，用最快的节点）…" % len(big))
+        big_ok = 0
+        for cdn, md5, size in big:
+            sub, _s, name = cdn.partition("/")
+            info("  %s  %s" % (cdn[:44], human_size(size)))
+            t0 = time.perf_counter()
+            got = single_download(RES_HOST, nodes[0], "/" + cdn, size, md5,
+                                  os.path.join(resroot, sub, name), st,
+                                  on_progress=_bar_progress("    "))
+            sys.stdout.write("\r" + " " * 60 + "\r")
+            sys.stdout.flush()
+            if got:
+                big_ok += 1
+                ok("    完成，%s" % human_speed(size / max(0.001, time.perf_counter() - t0)))
+            else:
+                err("    没下成功，重跑会自动补")
+        info("  大文件完成 %d/%d" % (big_ok, len(big)))
+        if not small:
+            info("")
+            info("现在打开 EVE 启动器，它会发现这些文件已经在本地，直接跳过下载。")
+            return big_ok == len(big)
+        info("")
+        step("剩下 %d 个小文件用 %d 条连接并发下…" % (len(small), threads))
+
+    missing = small
+    need_bytes = sum(m[2] for m in missing)
     lock = threading.Lock()
     state = {"done": 0, "bytes": 0, "failed": 0, "stop": False}
     queue = list(missing)
     queue.reverse()
 
-    def worker():
-        sess = PinnedSession(node_ip, RES_HOST,
+    def worker(widx=0):
+        sess = PinnedSession(nodes[widx % len(nodes)], RES_HOST,
                              timeout=float(st.get("predownload_timeout", 12.0)),
                              recycle=int(st.get("predownload_recycle", 64)))
         try:
@@ -2277,7 +2465,8 @@ def do_predownload(cfg, assume_yes=False):
         finally:
             sess.close()
 
-    workers = [threading.Thread(target=worker, daemon=True) for _ in range(threads)]
+    workers = [threading.Thread(target=worker, args=(i,), daemon=True)
+               for i in range(threads)]
     t0 = time.perf_counter()
     for w in workers:
         w.start()
