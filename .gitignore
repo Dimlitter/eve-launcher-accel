@@ -12,3 +12,7 @@ __pycache__/
 # 编辑器
 .vscode/
 .idea/
+
+# 下载下来的可执行文件（别再手滑提交进来）
+*.exe
+EVE-Accel-*

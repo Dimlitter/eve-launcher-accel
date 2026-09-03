@@ -35,7 +35,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 APP_NAME = "EVE 启动器更新加速器"
-APP_VER = "2.2.0"
+APP_VER = "2.3.0"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 EVELauncher/2")
 
@@ -101,7 +101,7 @@ DEFAULT_CONFIG = {
         "predownload_timeout": 12.0,  # 单个文件的超时，卡住的连接会被及时换掉
         "predownload_recycle": 64,   # 每条连接下多少个文件就重建，防止被中间设备静默掐死
         "shared_cache": "",          # EVE 共享缓存目录，留空 = 自动探测
-        "res_index": "auto"          # auto = 按平台挑索引；full = 跨平台全量索引
+        "res_index": "full"          # full = 客户端主清单(12万条)；platform = Windows 子集
     }
 }
 
@@ -2083,10 +2083,11 @@ class PinnedSession(object):
 
 
 def _pick_res_index(app_txt, st):
-    """挑一份和当前平台匹配的资源索引，返回 (文件名, CDN路径, 大小, md5)。
+    """挑一份资源索引，返回 (文件名, CDN路径, 大小, md5)。
 
-    全量索引是跨平台的，里面有 Windows 客户端根本不会下载的文件。照着它比对，
-    会让人白下几百 MB 用不到的东西。"""
+    默认用 resfileindex.txt。它有 12 万条，是客户端的主清单。
+    resfileindex_Windows.txt 只有 3222 条，是 Windows 的补充清单，
+    照着它比对会漏掉绝大部分文件，得出"本地已经齐了"的错误结论。"""
     found = {}
     for ln in app_txt.splitlines():
         if not ln.startswith("app:/resfileindex"):
@@ -2098,9 +2099,7 @@ def _pick_res_index(app_txt, st):
             found[f[0].split("/")[-1]] = (f[1].strip(), int(f[3]), f[2].strip())
         except ValueError:
             continue
-    if str(st.get("res_index", "auto")).lower() == "full":
-        order = ["resfileindex.txt"]
-    elif IS_WIN:
+    if str(st.get("res_index", "full")).lower() == "platform" and IS_WIN:
         order = ["resfileindex_Windows.txt", "resfileindex.txt"]
     else:
         order = ["resfileindex.txt"]
@@ -2371,6 +2370,7 @@ def do_predownload(cfg, assume_yes=False):
         missing.append((cdn, f[2].strip(), size))
     need_bytes = sum(m[2] for m in missing)
     info("  索引里 %d 个资源文件，本地已有 %d 个文件" % (total_entries, total_local))
+    dim("  注意：这里只比对资源文件(res)。客户端本体(bin64、code.ccp 等)交给启动器自己更新。")
     if not missing:
         ok("本地缓存已经是齐的，没有需要预下载的文件。")
         return True
